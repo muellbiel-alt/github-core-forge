@@ -500,7 +500,7 @@ function computeFetchObjects(
   return { sendOids: [...sendSet], newShallow, unshallow, ackOids };
 }
 
-function handleUploadPackV2(store: ForgeStore, repo: RepoRecord, packets: PktItem[], res: ServerResponse): void {
+function handleUploadPackV2(store: ForgeStore, repo: RepoRecord, packets: PktItem[], rawKey: string, res: ServerResponse): void {
   let command = '';
   let inArgs = false;
   const args: string[] = [];
@@ -564,6 +564,7 @@ function handleUploadPackV2(store: ForgeStore, repo: RepoRecord, packets: PktIte
     lines.push(FLUSH_BUF);
     const out = Buffer.concat(lines);
     if (repo.lsRefsCache.size < 32) repo.lsRefsCache.set(cacheKey, out);
+    if (repo.rawV2Cache.size < 64) repo.rawV2Cache.set(rawKey, out);
     res.writeHead(200, {
       'content-type': 'application/x-git-upload-pack-result',
       'content-length': out.length,
@@ -628,6 +629,7 @@ function handleUploadPackV2(store: ForgeStore, repo: RepoRecord, packets: PktIte
     const responseBuf = Buffer.concat(parts);
     if (repo.packCache.size >= 64) repo.packCache.clear();
     repo.packCache.set(cacheKey, responseBuf);
+    if (repo.rawV2Cache.size < 64) repo.rawV2Cache.set(rawKey, responseBuf);
     res.writeHead(200, {
       'content-type': 'application/x-git-upload-pack-result',
       'content-length': responseBuf.length,
@@ -791,6 +793,20 @@ export function handleGitRequest(
   }
 
   if (method === 'POST' && subpath === '/git-upload-pack') {
+    const proto = String(req.headers['git-protocol'] ?? '');
+    const isProtoV2 = proto.includes('version=2');
+    const rawKey = isProtoV2 ? body.toString('latin1') : '';
+    if (isProtoV2) {
+      const cached = repo.rawV2Cache.get(rawKey);
+      if (cached !== undefined) {
+        res.writeHead(200, {
+          'content-type': 'application/x-git-upload-pack-result',
+          'content-length': cached.length,
+        });
+        res.end(cached);
+        return;
+      }
+    }
     let packets: PktItem[];
     try {
       packets = decodePktLines(body, false).packets;
@@ -800,11 +816,13 @@ export function handleGitRequest(
       res.end(msg);
       return;
     }
-    const proto = String(req.headers['git-protocol'] ?? '');
     const firstData = packets.find((p) => p.kind === 'data');
-    const isV2 = proto.includes('version=2') || (firstData?.kind === 'data' && firstData.payload.toString('utf8').startsWith('command='));
-    if (isV2) handleUploadPackV2(store, repo, packets, res);
-    else handleUploadPackV0(repo, packets, res);
+    const isV2 = isProtoV2 || (firstData?.kind === 'data' && firstData.payload.toString('utf8').startsWith('command='));
+    if (isV2) {
+      handleUploadPackV2(store, repo, packets, rawKey || body.toString('latin1'), res);
+    } else {
+      handleUploadPackV0(repo, packets, res);
+    }
     return;
   }
 

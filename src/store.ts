@@ -130,6 +130,7 @@ export interface RepoRecord {
   nextIssueNumber: number;
   readonly packCache: Map<string, Buffer>;
   readonly lsRefsCache: Map<string, Buffer>;
+  readonly rawV2Cache: Map<string, Buffer>;
   receiveAdvCache: Buffer | null;
   readonly commitAncestryCache: Map<string, Set<string>>;
 }
@@ -343,6 +344,7 @@ export class ForgeStore {
       nextIssueNumber: 1,
       packCache: new Map(),
       lsRefsCache: new Map(),
+      rawV2Cache: new Map(),
       receiveAdvCache: null,
       commitAncestryCache: new Map(),
     };
@@ -398,6 +400,7 @@ export class ForgeStore {
   invalidateRepoGitCache(repo: RepoRecord): void {
     repo.packCache.clear();
     repo.lsRefsCache.clear();
+    repo.rawV2Cache.clear();
     repo.receiveAdvCache = null;
   }
 
@@ -423,6 +426,13 @@ export class ForgeStore {
 
   isAncestor(repo: RepoRecord, ancestorOid: string, descendantOid: string): boolean {
     if (ancestorOid === descendantOid) return true;
+    const firstObj = repo.objects.get(descendantOid);
+    if (firstObj && firstObj.type === 'commit' && firstObj.data.length >= 94) {
+      // Fast path for single-parent commit: "tree <40>\nparent <40>\n"
+      if (firstObj.data[45] === 0x0a && firstObj.data.subarray(46, 53).toString('ascii') === 'parent ') {
+        if (firstObj.data.subarray(53, 93).toString('ascii') === ancestorOid) return true;
+      }
+    }
     const visited = new Set<string>();
     const stack = [descendantOid];
     while (stack.length > 0) {
