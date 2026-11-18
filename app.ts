@@ -1,4 +1,6 @@
+import { createHash } from 'node:crypto';
 import { createServer, request as httpRequest, Agent as HttpAgent, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { deflateSync } from 'node:zlib';
 import { handleGitRequest } from './src/git.ts';
 import { handleGraphqlRequest } from './src/graphql.ts';
 import { handleMcpRequest } from './src/mcp.ts';
@@ -221,6 +223,23 @@ export async function warmUpServer(): Promise<void> {
       await Promise.all(Array.from({ length: 16 }, () => hit('GET', '/api/v3/repos/adaiversen/w/issues/1')));
     }
     await hit('PUT', '/api/v3/repos/adaiversen/w/contents/a.txt', Buffer.from('{"message":"m","content":"aGVsbG8="}'));
+    const warmBlob = Buffer.from('warm\n');
+    const warmBlobSha = createHash('sha1').update(`blob ${warmBlob.length}\0`).update(warmBlob).digest('hex');
+    const packHdr = Buffer.alloc(12);
+    packHdr.write('PACK', 0, 4, 'ascii');
+    packHdr.writeUInt32BE(2, 4);
+    packHdr.writeUInt32BE(1, 8);
+    const objHdr = Buffer.from([(3 << 4) | warmBlob.length]);
+    const packBody = Buffer.concat([packHdr, objHdr, deflateSync(warmBlob)]);
+    const warmPack = Buffer.concat([packBody, createHash('sha1').update(packBody).digest()]);
+    const zero40 = '0'.repeat(40);
+    const cmdLine = `${zero40} ${warmBlobSha} refs/heads/warm\u0000report-status-v2 side-band-64k\n`;
+    const cmdPkt = Buffer.from((cmdLine.length + 4).toString(16).padStart(4, '0') + cmdLine, 'ascii');
+    const recBody = Buffer.concat([cmdPkt, Buffer.from('0000', 'ascii'), warmPack]);
+    for (let i = 0; i < 20; i += 1) {
+      await hit('GET', '/adaiversen/w.git/info/refs?service=git-receive-pack');
+      await hit('POST', '/adaiversen/w.git/git-receive-pack', recBody, { 'content-type': 'application/x-git-receive-pack-request' });
+    }
     const lsRefsBody = Buffer.from('0014command=ls-refs\n00010009peel\n000csymrefs\n0000');
     const fetchBody = Buffer.from('0012command=fetch\n0001000bno-progress\n000ddeepen 1\n0009done\n0000');
     await Promise.all(
