@@ -1,10 +1,14 @@
-# github-core-clone-01 starter
+# github-core-clone-01 Forge
 
-A runnable starting point for [the contest](https://make.fun/bounty/github-core-clone-01): the entry's
-HTTP server and the lifecycle the harness drives it with. It answers two routes and a JSON 404 for
-everything else, so it boots and registers but passes almost nothing: the git smart-HTTP server, the
-REST v3 resources, GraphQL v4 and the MCP endpoint are the contest, and this is where you start
-building them.
+[![make.fun competition](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01)
+[![Rank](https://make.fun/badge/github-core-clone-01/muellbiel-alt/github-core-forge/rank.svg)](https://make.fun/bounty/github-core-clone-01)
+[![Reward](https://make.fun/badge/github-core-clone-01/muellbiel-alt/github-core-forge/reward.svg)](https://make.fun/bounty/github-core-clone-01)
+
+A standalone, deterministic, pure Node.js 22 GitHub-compatible git forge built for [make.fun `github-core-clone-01`](https://make.fun/bounty/github-core-clone-01):
+- Git smart HTTP (`/{owner}/{repo}.git`: `upload-pack` protocol v2 & v0, `receive-pack` v0)
+- GitHub REST API v3 (`/api/v3/...`)
+- GitHub GraphQL API v4 (`/api/graphql`)
+- Model Context Protocol Streamable HTTP (`/mcp`)
 
 ## Run it
 

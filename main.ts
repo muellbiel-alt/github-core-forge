@@ -79,6 +79,9 @@ async function waitForDone(): Promise<void> {
 /** Bound the port, register it, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
   const server = createApp();
+  server.keepAliveTimeout = 60_000;
+  server.headersTimeout = 65_000;
+  server.requestTimeout = 0;
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(0, () => resolve());

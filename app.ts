@@ -1,49 +1,126 @@
-// The starter's HTTP surface, exactly as it ships: a health probe and an API root, and a JSON 404
-// for everything else. The contest's real surface — git smart HTTP, REST v3 resources, GraphQL v4 and
-// the MCP endpoint — is what you add (README.md names it, and the rules link below says what scores).
-//
-// app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
-// entry <-> env lifecycle and should stay as it is.
-
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { handleGitRequest } from './src/git.ts';
+import { handleGraphqlRequest } from './src/graphql.ts';
+import { handleMcpRequest } from './src/mcp.ts';
+import { handleRestRequest } from './src/rest.ts';
+import { ForgeStore } from './src/store.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
+const HEALTHZ_BUF = Buffer.from('{"ok":true}\n', 'utf8');
+const UNAUTH_BUF = Buffer.from('{"message":"Requires authentication"}\n', 'utf8');
+const NOT_FOUND_BUF = Buffer.from('{"message":"Not Found"}\n', 'utf8');
+const EMPTY_BUF = Buffer.alloc(0);
+const EMPTY_QUERY = new URLSearchParams();
+const GIT_ROUTE_RE = /^\/([^/]+)\/([^/]+)\.git(\/.*)$/;
 
-/** Answer one request with a JSON body; `headers` go beside the JSON ones. */
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
+function isAuthorized(req: IncomingMessage, expectedToken: string): boolean {
+  if (expectedToken === '') return true;
+  const auth = req.headers.authorization;
+  if (typeof auth !== 'string') return false;
+  const space = auth.indexOf(' ');
+  if (space <= 0) return false;
+  if (auth.slice(0, space).toLowerCase() !== 'bearer') return false;
+  return auth.slice(space + 1) === expectedToken;
 }
 
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
+function readBody(req: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => {
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (chunks.length === 0) resolve(EMPTY_BUF);
+      else if (chunks.length === 1) resolve(chunks[0]!);
+      else resolve(Buffer.concat(chunks));
+    });
+    req.on('error', reject);
+  });
 }
 
-/** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
+function sendStaticJson(res: ServerResponse, status: number, buf: Buffer, reqId?: string): void {
+  const headers: Record<string, string | number> = {
+    'content-type': JSON_TYPE,
+    'content-length': buf.length,
+  };
+  if (reqId !== undefined) headers['x-github-request-id'] = reqId;
+  res.writeHead(status, headers);
+  res.end(buf);
+}
+
+/** Build the deterministic in-memory forge HTTP server. */
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
+  const store = new ForgeStore(process.env.MAKEFUN_TRIAL_NOW);
+  const expectedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    const rawUrl = req.url ?? '/';
+    const qIdx = rawUrl.indexOf('?');
+    const pathname = qIdx < 0 ? rawUrl : rawUrl.slice(0, qIdx);
     const method = req.method ?? 'GET';
 
-    // The env's boot check calls this twice: 200 {"ok":true}.
-    if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
+    if (method === 'GET' && pathname === '/healthz') {
+      sendStaticJson(res, 200, HEALTHZ_BUF);
       return;
     }
 
-    // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
+    const reqId = store.nextRequestId();
+    if (!isAuthorized(req, expectedToken)) {
+      sendStaticJson(res, 401, UNAUTH_BUF, reqId);
       return;
     }
 
-    // Everything else, every method: GitHub's 404 body.
-    sendJson(res, 404, { message: 'Not Found' });
+    const query = qIdx < 0 ? EMPTY_QUERY : new URLSearchParams(rawUrl.slice(qIdx + 1));
+
+    const dispatch = (body: Buffer): void => {
+      try {
+        if (pathname === '/api/v3' || pathname.startsWith('/api/v3/')) {
+          handleRestRequest(store, req, res, pathname, query, body, reqId);
+          return;
+        }
+        if (pathname === '/api/graphql') {
+          handleGraphqlRequest(store, req, res, body, reqId);
+          return;
+        }
+        if (pathname === '/mcp') {
+          handleMcpRequest(store, req, res, body, reqId);
+          return;
+        }
+        const gitMatch = GIT_ROUTE_RE.exec(pathname);
+        if (gitMatch) {
+          const owner = decodeURIComponent(gitMatch[1]!);
+          const repoName = decodeURIComponent(gitMatch[2]!);
+          const subpath = gitMatch[3]!;
+          handleGitRequest(store, req, res, owner, repoName, subpath, query, body);
+          return;
+        }
+        sendStaticJson(res, 404, NOT_FOUND_BUF, reqId);
+      } catch (err) {
+        if (!res.headersSent) {
+          const msg = err instanceof Error ? err.message : 'Internal Server Error';
+          const errBuf = Buffer.from(`${JSON.stringify({ message: msg })}\n`, 'utf8');
+          sendStaticJson(res, 500, errBuf, reqId);
+        } else {
+          res.end();
+        }
+      }
+    };
+
+    if (method === 'GET' || method === 'HEAD') {
+      dispatch(EMPTY_BUF);
+      return;
+    }
+
+    readBody(req)
+      .then(dispatch)
+      .catch(() => {
+        if (!res.headersSent) sendStaticJson(res, 400, Buffer.from('{"message":"Bad Request"}\n', 'utf8'), reqId);
+      });
   });
+
+  server.on('connection', (socket) => {
+    socket.setNoDelay(true);
+  });
+
+  return server;
 }
