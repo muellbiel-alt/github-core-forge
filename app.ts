@@ -128,6 +128,45 @@ export function createApp(): Server {
     });
     req.on('end', () => {
       const body = chunks.length === 0 ? EMPTY_BUF : chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks);
+      if (method === 'POST') {
+        const fastRepo = store.issuesPostCache.get(pathname);
+        if (fastRepo !== undefined) {
+          let parsed: unknown;
+          try {
+            parsed = body.length === 0 ? {} : JSON.parse(body.toString('utf8'));
+          } catch {
+            sendStaticJson(res, 400, Buffer.from('{"message":"Problems parsing JSON"}\n', 'utf8'), reqId);
+            return;
+          }
+          if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+            sendStaticJson(res, 400, Buffer.from('{"message":"Problems parsing JSON"}\n', 'utf8'), reqId);
+            return;
+          }
+          const d = parsed as Record<string, unknown>;
+          const title = typeof d.title === 'string' ? d.title : '';
+          if (!title) {
+            sendStaticJson(res, 422, Buffer.from('{"message":"Validation Failed: title is required"}\n', 'utf8'), reqId);
+            return;
+          }
+          const labels = Array.isArray(d.labels) ? d.labels.filter((l): l is string => typeof l === 'string') : undefined;
+          const created = store.createIssue(fastRepo, {
+            title,
+            body: typeof d.body === 'string' ? d.body : '',
+            labels,
+          });
+          if (!created.ok) {
+            sendStaticJson(res, 422, Buffer.from(`${JSON.stringify({ message: created.error })}\n`, 'utf8'), reqId);
+            return;
+          }
+          res.writeHead(201, {
+            'content-type': JSON_TYPE,
+            'content-length': created.issue.serializedJson.length,
+            'x-github-request-id': reqId,
+          });
+          res.end(created.issue.serializedJson);
+          return;
+        }
+      }
       dispatch(req, res, pathname, query, body, reqId);
     });
     req.on('error', () => {
@@ -175,16 +214,21 @@ export async function warmUpServer(): Promise<void> {
   try {
     await hit('POST', '/api/v3/user/repos', Buffer.from('{"name":"w"}'));
     const issueBody = Buffer.from('{"title":"w","body":"b"}');
-    await Promise.all(Array.from({ length: 50 }, () => hit('POST', '/api/v3/repos/adaiversen/w/issues', issueBody)));
-    const batch = Array.from({ length: 16 }, () => hit('GET', '/api/v3/repos/adaiversen/w/issues/1'));
-    await Promise.all(batch);
-    for (let i = 0; i < 60; i += 1) {
+    for (let i = 0; i < 4; i += 1) {
+      await Promise.all(Array.from({ length: 25 }, () => hit('POST', '/api/v3/repos/adaiversen/w/issues', issueBody)));
+    }
+    for (let i = 0; i < 100; i += 1) {
       await Promise.all(Array.from({ length: 16 }, () => hit('GET', '/api/v3/repos/adaiversen/w/issues/1')));
     }
+    await hit('PUT', '/api/v3/repos/adaiversen/w/contents/a.txt', Buffer.from('{"message":"m","content":"aGVsbG8="}'));
+    const lsRefsBody = Buffer.from('0014command=ls-refs\n00010009peel\n000csymrefs\n0000');
+    const fetchBody = Buffer.from('0012command=fetch\n0001000bno-progress\n000ddeepen 1\n0009done\n0000');
     await Promise.all(
       Array.from({ length: 20 }, () =>
-        hit('GET', '/api/v3/repos/adaiversen/w/issues/1').then(() =>
-          hit('GET', '/adaiversen/w.git/info/refs?service=git-upload-pack', undefined, { 'git-protocol': 'version=2' }),
+        hit('GET', '/adaiversen/w.git/info/refs?service=git-upload-pack', undefined, { 'git-protocol': 'version=2' }).then(() =>
+          hit('POST', '/adaiversen/w.git/git-upload-pack', lsRefsBody, { 'git-protocol': 'version=2', 'content-type': 'application/x-git-upload-pack-request' }),
+        ).then(() =>
+          hit('POST', '/adaiversen/w.git/git-upload-pack', fetchBody, { 'git-protocol': 'version=2', 'content-type': 'application/x-git-upload-pack-request' }),
         ),
       ),
     );

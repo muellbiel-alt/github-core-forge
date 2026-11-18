@@ -31,6 +31,8 @@ const V2_UPLOAD_PACK_ADV = Buffer.concat([
   FLUSH_BUF,
 ]);
 const RECEIVE_CAPS = 'report-status report-status-v2 delete-refs side-band-64k ofs-delta agent=makefun-forge/1.0';
+const RECEIVE_ADV_PREFIX = Buffer.concat([pktLine('# service=git-receive-pack\n'), FLUSH_BUF]);
+const RECEIVE_MAIN_HEAD_LEN = (4 + 40 + 1 + 15 + 1 + RECEIVE_CAPS.length + 1).toString(16).padStart(4, '0');
 const MAIN_OK_INNER = Buffer.concat([pktLine('unpack ok\n'), pktLine('ok refs/heads/main\n'), FLUSH_BUF]);
 const MAIN_OK_SIDEBAND = Buffer.concat([pktSideband(1, MAIN_OK_INNER), FLUSH_BUF]);
 const EMPTY_PACK = (() => {
@@ -763,7 +765,24 @@ export function handleGitRequest(
         res.end(repo.receiveAdvCache);
         return;
       }
-      const parts: Buffer[] = [pktLine('# service=git-receive-pack\n'), FLUSH_BUF];
+      let out: Buffer;
+      if (repo.refs.size === 1) {
+        const mainOid = repo.refs.get('refs/heads/main');
+        if (mainOid !== undefined && repo.objects.get(mainOid)?.type !== 'tag') {
+          out = Buffer.from(
+            `001f# service=git-receive-pack\n0000${RECEIVE_MAIN_HEAD_LEN}${mainOid} refs/heads/main\u0000${RECEIVE_CAPS}\n0000`,
+            'ascii',
+          );
+          repo.receiveAdvCache = out;
+          res.writeHead(200, {
+            'content-type': 'application/x-git-receive-pack-advertisement',
+            'content-length': out.length,
+          });
+          res.end(out);
+          return;
+        }
+      }
+      const parts: Buffer[] = [RECEIVE_ADV_PREFIX];
       if (repo.refs.size === 0) {
         parts.push(pktLine(`${ZERO_OID} capabilities^{}\u0000${RECEIVE_CAPS}\n`));
       } else {
@@ -776,7 +795,7 @@ export function handleGitRequest(
         }
       }
       parts.push(FLUSH_BUF);
-      const out = Buffer.concat(parts);
+      out = Buffer.concat(parts);
       repo.receiveAdvCache = out;
       res.writeHead(200, {
         'content-type': 'application/x-git-receive-pack-advertisement',

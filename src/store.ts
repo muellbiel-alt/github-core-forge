@@ -270,6 +270,7 @@ export class ForgeStore {
   private readonly repoList: RepoRecord[] = [];
   private readonly nodes = new Map<string, NodeRef>();
   readonly issueRouteCache = new Map<string, Buffer>();
+  readonly issuesPostCache = new Map<string, RepoRecord>();
 
   constructor(trialNowIso?: string) {
     let parsed = 1_735_689_600_000;
@@ -351,17 +352,20 @@ export class ForgeStore {
     this.reposByKey.set(key, repo);
     this.repoList.push(repo);
     this.nodes.set(repo.node_id, { kind: 'Repository', repo });
+    this.issuesPostCache.set(`/api/v3/repos/${repo.owner}/${repo.name}/issues`, repo);
     return repo;
   }
 
   updateRepo(repo: RepoRecord, patch: { description?: string; private?: boolean; default_branch?: string; name?: string }): RepoRecord {
     if (patch.name !== undefined && patch.name !== repo.name) {
+      this.issuesPostCache.delete(`/api/v3/repos/${repo.owner}/${repo.name}/issues`);
       for (const issue of repo.issueList) {
         this.issueRouteCache.delete(`/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`);
       }
       this.reposByKey.delete(this.repoKey(repo.owner, repo.name));
       repo.name = patch.name;
       this.reposByKey.set(this.repoKey(repo.owner, repo.name), repo);
+      this.issuesPostCache.set(`/api/v3/repos/${repo.owner}/${repo.name}/issues`, repo);
       for (const issue of repo.issueList) {
         this.issueRouteCache.set(`/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`, issue.serializedJson);
       }
@@ -377,6 +381,7 @@ export class ForgeStore {
     const repo = this.getRepo(owner, name);
     if (!repo) return false;
     this.reposByKey.delete(this.repoKey(owner, name));
+    this.issuesPostCache.delete(`/api/v3/repos/${repo.owner}/${repo.name}/issues`);
     const idx = this.repoList.indexOf(repo);
     if (idx >= 0) this.repoList.splice(idx, 1);
     this.nodes.delete(repo.node_id);
@@ -398,9 +403,9 @@ export class ForgeStore {
   }
 
   invalidateRepoGitCache(repo: RepoRecord): void {
-    repo.packCache.clear();
-    repo.lsRefsCache.clear();
-    repo.rawV2Cache.clear();
+    if (repo.packCache.size > 0) repo.packCache.clear();
+    if (repo.lsRefsCache.size > 0) repo.lsRefsCache.clear();
+    if (repo.rawV2Cache.size > 0) repo.rawV2Cache.clear();
     repo.receiveAdvCache = null;
   }
 
