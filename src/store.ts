@@ -13,6 +13,12 @@ export const VIEWER = Object.freeze({
   type: 'User',
 });
 
+const VIEWER_SUMMARY = Object.freeze({
+  login: VIEWER.login,
+  id: VIEWER.id,
+  type: VIEWER.type,
+});
+
 export type GitObjectType = 'commit' | 'tree' | 'blob' | 'tag';
 
 export interface GitObject {
@@ -643,7 +649,7 @@ export class ForgeStore {
       state: issue.state,
       labels: issue.labels,
       comments: issue.comments.length,
-      user: { login: VIEWER.login, id: VIEWER.id, type: VIEWER.type },
+      user: VIEWER_SUMMARY,
       created_at: issue.created_at,
       updated_at: issue.updated_at,
       closed_at: issue.closed_at,
@@ -728,7 +734,7 @@ export class ForgeStore {
       body,
       created_at: iso,
       updated_at: iso,
-      user: { login: VIEWER.login, id: VIEWER.id, type: VIEWER.type },
+      user: VIEWER_SUMMARY,
     };
     issue.comments.push(comment);
     issue.updated_at = iso;

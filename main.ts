@@ -16,7 +16,7 @@
 //
 // main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
 
-import { createApp } from './app.ts';
+import { createApp, warmUpServer } from './app.ts';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
@@ -78,6 +78,7 @@ async function waitForDone(): Promise<void> {
 
 /** Bound the port, register it, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
+  await warmUpServer();
   const server = createApp();
   server.keepAliveTimeout = 60_000;
   server.headersTimeout = 65_000;

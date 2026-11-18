@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer, request as httpRequest, Agent as HttpAgent, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { handleGitRequest } from './src/git.ts';
 import { handleGraphqlRequest } from './src/graphql.ts';
 import { handleMcpRequest } from './src/mcp.ts';
@@ -140,4 +140,56 @@ export function createApp(): Server {
   });
 
   return server;
+}
+
+/** Run a short throwaway loopback warmup so V8 JIT-compiles hot server paths before registration. */
+export async function warmUpServer(): Promise<void> {
+  const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  const authHeader = token === '' ? '' : `Bearer ${token}`;
+  const warmServer = createApp();
+  await new Promise<void>((resolve) => warmServer.listen(0, '127.0.0.1', () => resolve()));
+  const addr = warmServer.address();
+  if (addr === null || typeof addr === 'string') {
+    warmServer.close();
+    return;
+  }
+  const port = addr.port;
+  const agent = new HttpAgent({ keepAlive: true, maxSockets: 16 });
+  const hit = (method: string, path: string, body?: Buffer, extra?: Readonly<Record<string, string>>): Promise<void> =>
+    new Promise((resolve) => {
+      const headers: Record<string, string | number> = { ...extra };
+      if (authHeader !== '') headers.authorization = authHeader;
+      if (body !== undefined) {
+        headers['content-type'] = headers['content-type'] ?? 'application/json';
+        headers['content-length'] = body.length;
+      }
+      const req = httpRequest({ host: '127.0.0.1', port, method, path, agent, headers }, (res) => {
+        res.resume();
+        res.on('end', resolve);
+      });
+      req.on('error', () => resolve());
+      if (body !== undefined) req.end(body);
+      else req.end();
+    });
+
+  try {
+    await hit('POST', '/api/v3/user/repos', Buffer.from('{"name":"w"}'));
+    const issueBody = Buffer.from('{"title":"w","body":"b"}');
+    await Promise.all(Array.from({ length: 50 }, () => hit('POST', '/api/v3/repos/adaiversen/w/issues', issueBody)));
+    const batch = Array.from({ length: 16 }, () => hit('GET', '/api/v3/repos/adaiversen/w/issues/1'));
+    await Promise.all(batch);
+    for (let i = 0; i < 60; i += 1) {
+      await Promise.all(Array.from({ length: 16 }, () => hit('GET', '/api/v3/repos/adaiversen/w/issues/1')));
+    }
+    await Promise.all(
+      Array.from({ length: 20 }, () =>
+        hit('GET', '/api/v3/repos/adaiversen/w/issues/1').then(() =>
+          hit('GET', '/adaiversen/w.git/info/refs?service=git-upload-pack', undefined, { 'git-protocol': 'version=2' }),
+        ),
+      ),
+    );
+  } finally {
+    agent.destroy();
+    await new Promise<void>((resolve) => warmServer.close(() => resolve()));
+  }
 }

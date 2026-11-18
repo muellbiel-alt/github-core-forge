@@ -31,6 +31,8 @@ const V2_UPLOAD_PACK_ADV = Buffer.concat([
   FLUSH_BUF,
 ]);
 const RECEIVE_CAPS = 'report-status report-status-v2 delete-refs side-band-64k ofs-delta agent=makefun-forge/1.0';
+const MAIN_OK_INNER = Buffer.concat([pktLine('unpack ok\n'), pktLine('ok refs/heads/main\n'), FLUSH_BUF]);
+const MAIN_OK_SIDEBAND = Buffer.concat([pktSideband(1, MAIN_OK_INNER), FLUSH_BUF]);
 const EMPTY_PACK = (() => {
   const hdr = Buffer.alloc(12);
   hdr.write('PACK', 0, 4, 'ascii');
@@ -190,7 +192,7 @@ function unpackPack(repo: RepoRecord, pack: Buffer): void {
   }
 
   const raw: RawPackEntry[] = [];
-  const byOffset = new Map<number, RawPackEntry>();
+  let byOffset: Map<number, RawPackEntry> | null = null;
   let offset = 12;
   const bodySlice = pack.subarray(0, trailerStart);
 
@@ -199,6 +201,27 @@ function unpackPack(repo: RepoRecord, pack: Buffer): void {
     const hdr = readVarintSize(pack, offset);
     offset = hdr.next;
     const typeCode = (hdr.first >> 4) & 0x07;
+    if (typeCode >= 1 && typeCode <= 4 && byOffset === null) {
+      const inflated = inflateSync(bodySlice.subarray(offset), { info: true }) as unknown as {
+        buffer: Buffer;
+        engine: { bytesWritten: number };
+      };
+      if (inflated.buffer.length !== hdr.size) throw new PackError('Inflated size mismatch');
+      offset += inflated.engine.bytesWritten;
+      const type = CODE_TYPE[typeCode]!;
+      const oid = hashGitObject(type, inflated.buffer);
+      if (!repo.objects.has(oid)) {
+        repo.objects.set(oid, { type, data: inflated.buffer });
+      }
+      raw.push({ offset: entryOffset, typeCode, size: hdr.size, data: inflated.buffer, resolvedType: type, resolvedData: inflated.buffer, oid });
+      continue;
+    }
+
+    if (byOffset === null) {
+      byOffset = new Map<number, RawPackEntry>();
+      for (const prev of raw) byOffset.set(prev.offset, prev);
+    }
+
     const entry: RawPackEntry = { offset: entryOffset, typeCode, size: hdr.size, data: Buffer.alloc(0) };
     if (typeCode === 6) {
       const ofs = readOfsDeltaOffset(pack, offset);
@@ -223,7 +246,12 @@ function unpackPack(repo: RepoRecord, pack: Buffer): void {
   }
   if (offset !== trailerStart) throw new PackError('Trailing bytes before pack trailer');
 
+  if (byOffset === null) return;
+
   const byOid = new Map<string, RawPackEntry>();
+  for (const prev of raw) {
+    if (prev.oid) byOid.set(prev.oid, prev);
+  }
   const resolve = (entry: RawPackEntry): { type: GitObjectType; data: Buffer; oid: string } => {
     if (entry.resolvedData && entry.resolvedType && entry.oid) {
       return { type: entry.resolvedType, data: entry.resolvedData, oid: entry.oid };
@@ -231,7 +259,7 @@ function unpackPack(repo: RepoRecord, pack: Buffer): void {
     let type: GitObjectType;
     let data: Buffer;
     if (entry.typeCode === 6) {
-      const baseEntry = byOffset.get(entry.baseOffset!);
+      const baseEntry = byOffset!.get(entry.baseOffset!);
       if (!baseEntry) throw new PackError('Missing ofs-delta base');
       const base = resolve(baseEntry);
       type = base.type;
@@ -261,6 +289,7 @@ function unpackPack(repo: RepoRecord, pack: Buffer): void {
   };
 
   for (const entry of raw) {
+    if (entry.oid) continue;
     const resolved = resolve(entry);
     if (!repo.objects.has(resolved.oid)) {
       repo.objects.set(resolved.oid, { type: resolved.type, data: resolved.data });
@@ -825,6 +854,34 @@ export function handleGitRequest(
       }
     }
 
+    const useSideband = caps.has('side-band-64k') || caps.has('side-band');
+    let out: Buffer;
+    if (
+      unpackError === null &&
+      useSideband &&
+      commands.length === 1 &&
+      commands[0]!.ref === 'refs/heads/main'
+    ) {
+      const cmd = commands[0]!;
+      const currentOid = repo.refs.get(cmd.ref) ?? ZERO_OID;
+      if (
+        cmd.oldOid === currentOid &&
+        cmd.newOid !== ZERO_OID &&
+        repo.objects.has(cmd.newOid) &&
+        (currentOid === ZERO_OID || store.isAncestor(repo, currentOid, cmd.newOid))
+      ) {
+        repo.refs.set(cmd.ref, cmd.newOid);
+        store.invalidateRepoGitCache(repo);
+        out = MAIN_OK_SIDEBAND;
+        res.writeHead(200, {
+          'content-type': 'application/x-git-receive-pack-result',
+          'content-length': out.length,
+        });
+        res.end(out);
+        return;
+      }
+    }
+
     const reportLines: Buffer[] = [];
     if (unpackError !== null) {
       reportLines.push(pktLine(`unpack error ${unpackError}\n`));
@@ -862,7 +919,7 @@ export function handleGitRequest(
     }
     reportLines.push(FLUSH_BUF);
     const inner = Buffer.concat(reportLines);
-    const out = caps.has('side-band-64k') || caps.has('side-band')
+    out = useSideband
       ? Buffer.concat([pktSideband(1, inner), FLUSH_BUF])
       : inner;
 
