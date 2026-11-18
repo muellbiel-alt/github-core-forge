@@ -22,6 +22,15 @@ const CODE_TYPE: Readonly<Record<number, GitObjectType>> = { 1: 'commit', 2: 'tr
 
 const FLUSH_BUF = Buffer.from('0000', 'ascii');
 const DELIM_BUF = Buffer.from('0001', 'ascii');
+const V2_UPLOAD_PACK_ADV = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine('agent=makefun-forge/1.0\n'),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow filter\n'),
+  pktLine('object-format=sha1\n'),
+  FLUSH_BUF,
+]);
+const RECEIVE_CAPS = 'report-status report-status-v2 delete-refs side-band-64k ofs-delta agent=makefun-forge/1.0';
 const EMPTY_PACK = (() => {
   const hdr = Buffer.alloc(12);
   hdr.write('PACK', 0, 4, 'ascii');
@@ -493,6 +502,16 @@ function handleUploadPackV2(store: ForgeStore, repo: RepoRecord, packets: PktIte
       else if (arg === 'unborn') unborn = true;
       else if (arg.startsWith('ref-prefix ')) prefixes.push(arg.slice(11));
     }
+    const cacheKey = `${peel ? 1 : 0}|${symrefs ? 1 : 0}|${unborn ? 1 : 0}|${prefixes.join('\0')}`;
+    const cached = repo.lsRefsCache.get(cacheKey);
+    if (cached !== undefined) {
+      res.writeHead(200, {
+        'content-type': 'application/x-git-upload-pack-result',
+        'content-length': cached.length,
+      });
+      res.end(cached);
+      return;
+    }
     const matchesPrefix = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
     const lines: Buffer[] = [];
     const defaultRef = `refs/heads/${repo.defaultBranch}`;
@@ -515,6 +534,7 @@ function handleUploadPackV2(store: ForgeStore, repo: RepoRecord, packets: PktIte
     }
     lines.push(FLUSH_BUF);
     const out = Buffer.concat(lines);
+    if (repo.lsRefsCache.size < 32) repo.lsRefsCache.set(cacheKey, out);
     res.writeHead(200, {
       'content-type': 'application/x-git-upload-pack-result',
       'content-length': out.length,
@@ -666,19 +686,11 @@ export function handleGitRequest(
     if (service === 'git-upload-pack') {
       const proto = String(req.headers['git-protocol'] ?? '');
       if (proto.includes('version=2')) {
-        const out = Buffer.concat([
-          pktLine('version 2\n'),
-          pktLine('agent=makefun-forge/1.0\n'),
-          pktLine('ls-refs=unborn\n'),
-          pktLine('fetch=shallow filter\n'),
-          pktLine('object-format=sha1\n'),
-          FLUSH_BUF,
-        ]);
         res.writeHead(200, {
           'content-type': 'application/x-git-upload-pack-advertisement',
-          'content-length': out.length,
+          'content-length': V2_UPLOAD_PACK_ADV.length,
         });
-        res.end(out);
+        res.end(V2_UPLOAD_PACK_ADV);
         return;
       }
 
@@ -712,14 +724,21 @@ export function handleGitRequest(
     }
 
     if (service === 'git-receive-pack') {
-      const caps = 'report-status report-status-v2 delete-refs side-band-64k ofs-delta agent=makefun-forge/1.0';
+      if (repo.receiveAdvCache !== null) {
+        res.writeHead(200, {
+          'content-type': 'application/x-git-receive-pack-advertisement',
+          'content-length': repo.receiveAdvCache.length,
+        });
+        res.end(repo.receiveAdvCache);
+        return;
+      }
       const parts: Buffer[] = [pktLine('# service=git-receive-pack\n'), FLUSH_BUF];
       if (repo.refs.size === 0) {
-        parts.push(pktLine(`${ZERO_OID} capabilities^{}\u0000${caps}\n`));
+        parts.push(pktLine(`${ZERO_OID} capabilities^{}\u0000${RECEIVE_CAPS}\n`));
       } else {
         let first = true;
         for (const [refName, oid] of [...repo.refs.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
-          parts.push(pktLine(first ? `${oid} ${refName}\u0000${caps}\n` : `${oid} ${refName}\n`));
+          parts.push(pktLine(first ? `${oid} ${refName}\u0000${RECEIVE_CAPS}\n` : `${oid} ${refName}\n`));
           first = false;
           const peeled = store.peelOid(repo, oid);
           if (peeled) parts.push(pktLine(`${peeled} ${refName}^{}\n`));
@@ -727,6 +746,7 @@ export function handleGitRequest(
       }
       parts.push(FLUSH_BUF);
       const out = Buffer.concat(parts);
+      repo.receiveAdvCache = out;
       res.writeHead(200, {
         'content-type': 'application/x-git-receive-pack-advertisement',
         'content-length': out.length,

@@ -9,33 +9,20 @@ const JSON_TYPE = 'application/json; charset=utf-8';
 const HEALTHZ_BUF = Buffer.from('{"ok":true}\n', 'utf8');
 const UNAUTH_BUF = Buffer.from('{"message":"Requires authentication"}\n', 'utf8');
 const NOT_FOUND_BUF = Buffer.from('{"message":"Not Found"}\n', 'utf8');
+const BAD_REQ_BUF = Buffer.from('{"message":"Bad Request"}\n', 'utf8');
 const EMPTY_BUF = Buffer.alloc(0);
 const EMPTY_QUERY = new URLSearchParams();
 const GIT_ROUTE_RE = /^\/([^/]+)\/([^/]+)\.git(\/.*)$/;
 
-function isAuthorized(req: IncomingMessage, expectedToken: string): boolean {
+function isAuthorized(req: IncomingMessage, expectedToken: string, expectedBearer: string): boolean {
   if (expectedToken === '') return true;
   const auth = req.headers.authorization;
+  if (auth === expectedBearer) return true;
   if (typeof auth !== 'string') return false;
   const space = auth.indexOf(' ');
   if (space <= 0) return false;
   if (auth.slice(0, space).toLowerCase() !== 'bearer') return false;
   return auth.slice(space + 1) === expectedToken;
-}
-
-function readBody(req: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => {
-      chunks.push(chunk);
-    });
-    req.on('end', () => {
-      if (chunks.length === 0) resolve(EMPTY_BUF);
-      else if (chunks.length === 1) resolve(chunks[0]!);
-      else resolve(Buffer.concat(chunks));
-    });
-    req.on('error', reject);
-  });
 }
 
 function sendStaticJson(res: ServerResponse, status: number, buf: Buffer, reqId?: string): void {
@@ -52,6 +39,48 @@ function sendStaticJson(res: ServerResponse, status: number, buf: Buffer, reqId?
 export function createApp(): Server {
   const store = new ForgeStore(process.env.MAKEFUN_TRIAL_NOW);
   const expectedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  const expectedBearer = expectedToken === '' ? '' : `Bearer ${expectedToken}`;
+
+  const dispatch = (
+    req: IncomingMessage,
+    res: ServerResponse,
+    pathname: string,
+    query: URLSearchParams,
+    body: Buffer,
+    reqId: string,
+  ): void => {
+    try {
+      if (pathname === '/api/v3' || pathname.startsWith('/api/v3/')) {
+        handleRestRequest(store, req, res, pathname, query, body, reqId);
+        return;
+      }
+      if (pathname === '/api/graphql') {
+        handleGraphqlRequest(store, req, res, body, reqId);
+        return;
+      }
+      if (pathname === '/mcp') {
+        handleMcpRequest(store, req, res, body, reqId);
+        return;
+      }
+      const gitMatch = GIT_ROUTE_RE.exec(pathname);
+      if (gitMatch) {
+        const owner = decodeURIComponent(gitMatch[1]!);
+        const repoName = decodeURIComponent(gitMatch[2]!);
+        const subpath = gitMatch[3]!;
+        handleGitRequest(store, req, res, owner, repoName, subpath, query, body);
+        return;
+      }
+      sendStaticJson(res, 404, NOT_FOUND_BUF, reqId);
+    } catch (err) {
+      if (!res.headersSent) {
+        const msg = err instanceof Error ? err.message : 'Internal Server Error';
+        const errBuf = Buffer.from(`${JSON.stringify({ message: msg })}\n`, 'utf8');
+        sendStaticJson(res, 500, errBuf, reqId);
+      } else {
+        res.end();
+      }
+    }
+  };
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const rawUrl = req.url ?? '/';
@@ -65,57 +94,45 @@ export function createApp(): Server {
     }
 
     const reqId = store.nextRequestId();
-    if (!isAuthorized(req, expectedToken)) {
+    if (!isAuthorized(req, expectedToken, expectedBearer)) {
       sendStaticJson(res, 401, UNAUTH_BUF, reqId);
       return;
     }
 
-    const query = qIdx < 0 ? EMPTY_QUERY : new URLSearchParams(rawUrl.slice(qIdx + 1));
-
-    const dispatch = (body: Buffer): void => {
-      try {
-        if (pathname === '/api/v3' || pathname.startsWith('/api/v3/')) {
-          handleRestRequest(store, req, res, pathname, query, body, reqId);
-          return;
-        }
-        if (pathname === '/api/graphql') {
-          handleGraphqlRequest(store, req, res, body, reqId);
-          return;
-        }
-        if (pathname === '/mcp') {
-          handleMcpRequest(store, req, res, body, reqId);
-          return;
-        }
-        const gitMatch = GIT_ROUTE_RE.exec(pathname);
-        if (gitMatch) {
-          const owner = decodeURIComponent(gitMatch[1]!);
-          const repoName = decodeURIComponent(gitMatch[2]!);
-          const subpath = gitMatch[3]!;
-          handleGitRequest(store, req, res, owner, repoName, subpath, query, body);
-          return;
-        }
-        sendStaticJson(res, 404, NOT_FOUND_BUF, reqId);
-      } catch (err) {
-        if (!res.headersSent) {
-          const msg = err instanceof Error ? err.message : 'Internal Server Error';
-          const errBuf = Buffer.from(`${JSON.stringify({ message: msg })}\n`, 'utf8');
-          sendStaticJson(res, 500, errBuf, reqId);
-        } else {
-          res.end();
-        }
+    if (method === 'GET') {
+      const cachedIssue = store.issueRouteCache.get(pathname);
+      if (cachedIssue !== undefined) {
+        res.writeHead(200, {
+          'content-type': JSON_TYPE,
+          'content-length': cachedIssue.length,
+          'x-github-request-id': reqId,
+        });
+        res.end(cachedIssue);
+        return;
       }
-    };
-
-    if (method === 'GET' || method === 'HEAD') {
-      dispatch(EMPTY_BUF);
+      const query = qIdx < 0 ? EMPTY_QUERY : new URLSearchParams(rawUrl.slice(qIdx + 1));
+      dispatch(req, res, pathname, query, EMPTY_BUF, reqId);
       return;
     }
 
-    readBody(req)
-      .then(dispatch)
-      .catch(() => {
-        if (!res.headersSent) sendStaticJson(res, 400, Buffer.from('{"message":"Bad Request"}\n', 'utf8'), reqId);
-      });
+    if (method === 'HEAD') {
+      const query = qIdx < 0 ? EMPTY_QUERY : new URLSearchParams(rawUrl.slice(qIdx + 1));
+      dispatch(req, res, pathname, query, EMPTY_BUF, reqId);
+      return;
+    }
+
+    const query = qIdx < 0 ? EMPTY_QUERY : new URLSearchParams(rawUrl.slice(qIdx + 1));
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => {
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      const body = chunks.length === 0 ? EMPTY_BUF : chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks);
+      dispatch(req, res, pathname, query, body, reqId);
+    });
+    req.on('error', () => {
+      if (!res.headersSent) sendStaticJson(res, 400, BAD_REQ_BUF, reqId);
+    });
   });
 
   server.on('connection', (socket) => {

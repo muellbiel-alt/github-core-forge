@@ -123,6 +123,8 @@ export interface RepoRecord {
   readonly pullList: PullRequestRecord[];
   nextIssueNumber: number;
   readonly packCache: Map<string, Buffer>;
+  readonly lsRefsCache: Map<string, Buffer>;
+  receiveAdvCache: Buffer | null;
   readonly commitAncestryCache: Map<string, Set<string>>;
 }
 
@@ -260,6 +262,7 @@ export class ForgeStore {
   private readonly reposByKey = new Map<string, RepoRecord>();
   private readonly repoList: RepoRecord[] = [];
   private readonly nodes = new Map<string, NodeRef>();
+  readonly issueRouteCache = new Map<string, Buffer>();
 
   constructor(trialNowIso?: string) {
     let parsed = 1_735_689_600_000;
@@ -273,7 +276,7 @@ export class ForgeStore {
 
   nextRequestId(): string {
     this.reqSeq += 1;
-    return `req-${this.reqSeq.toString(16).padStart(8, '0')}`;
+    return `r${this.reqSeq}`;
   }
 
   private nextSeq(): number {
@@ -333,6 +336,8 @@ export class ForgeStore {
       pullList: [],
       nextIssueNumber: 1,
       packCache: new Map(),
+      lsRefsCache: new Map(),
+      receiveAdvCache: null,
       commitAncestryCache: new Map(),
     };
     this.reposByKey.set(key, repo);
@@ -343,9 +348,15 @@ export class ForgeStore {
 
   updateRepo(repo: RepoRecord, patch: { description?: string; private?: boolean; default_branch?: string; name?: string }): RepoRecord {
     if (patch.name !== undefined && patch.name !== repo.name) {
+      for (const issue of repo.issueList) {
+        this.issueRouteCache.delete(`/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`);
+      }
       this.reposByKey.delete(this.repoKey(repo.owner, repo.name));
       repo.name = patch.name;
       this.reposByKey.set(this.repoKey(repo.owner, repo.name), repo);
+      for (const issue of repo.issueList) {
+        this.issueRouteCache.set(`/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`, issue.serializedJson);
+      }
     }
     if (patch.description !== undefined) repo.description = patch.description;
     if (patch.private !== undefined) repo.private = patch.private;
@@ -362,6 +373,7 @@ export class ForgeStore {
     if (idx >= 0) this.repoList.splice(idx, 1);
     this.nodes.delete(repo.node_id);
     for (const issue of repo.issueList) {
+      this.issueRouteCache.delete(`/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`);
       this.nodes.delete(issue.node_id);
       for (const c of issue.comments) this.nodes.delete(c.node_id);
     }
@@ -379,6 +391,8 @@ export class ForgeStore {
 
   invalidateRepoGitCache(repo: RepoRecord): void {
     repo.packCache.clear();
+    repo.lsRefsCache.clear();
+    repo.receiveAdvCache = null;
   }
 
   resolveRef(repo: RepoRecord, refOrSha: string | undefined): string | null {
@@ -636,6 +650,7 @@ export class ForgeStore {
       url: `/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
     };
     issue.serializedJson = Buffer.from(`${JSON.stringify(obj)}\n`, 'utf8');
+    this.issueRouteCache.set(`/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`, issue.serializedJson);
     return issue.serializedJson;
   }
 
