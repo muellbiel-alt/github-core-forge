@@ -18,6 +18,8 @@ import {
 const PKT_MAX = 65520;
 const SIDEBAND_CHUNK_MAX = PKT_MAX - 5; // 4-byte pkt header + 1-byte band
 const HEX4 = /^[0-9a-fA-F]{4}$/;
+/** One frozen options object for every inflateSync call: no per-call allocation. */
+const INFLATE_INFO = Object.freeze({ info: true }) as { info: true };
 const CODE_TYPE: Readonly<Record<number, GitObjectType>> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
 
 const FLUSH_BUF = Buffer.from('0000', 'ascii');
@@ -204,7 +206,7 @@ function unpackPack(repo: RepoRecord, pack: Buffer): void {
     offset = hdr.next;
     const typeCode = (hdr.first >> 4) & 0x07;
     if (typeCode >= 1 && typeCode <= 4 && byOffset === null) {
-      const inflated = inflateSync(bodySlice.subarray(offset), { info: true }) as unknown as {
+      const inflated = inflateSync(bodySlice.subarray(offset), INFLATE_INFO) as unknown as {
         buffer: Buffer;
         engine: { bytesWritten: number };
       };
@@ -236,7 +238,7 @@ function unpackPack(repo: RepoRecord, pack: Buffer): void {
     } else if (!CODE_TYPE[typeCode]) {
       throw new PackError(`Unknown pack entry type ${typeCode}`);
     }
-    const inflated = inflateSync(bodySlice.subarray(offset), { info: true }) as unknown as {
+    const inflated = inflateSync(bodySlice.subarray(offset), INFLATE_INFO) as unknown as {
       buffer: Buffer;
       engine: { bytesWritten: number };
     };

@@ -145,8 +145,8 @@ export type NodeRef =
 const TYPE_CODE: Readonly<Record<GitObjectType, number>> = { commit: 1, tree: 2, blob: 3, tag: 4 };
 
 export function hashGitObject(type: GitObjectType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\u0000`, 'utf8');
-  return createHash('sha1').update(header).update(data).digest('hex');
+  // Pass the header as a string: update() accepts it directly, so no Buffer allocation.
+  return createHash('sha1').update(`${type} ${data.length}\u0000`, 'utf8').update(data).digest('hex');
 }
 
 export function encodePackObjectEntry(obj: GitObject): Buffer {

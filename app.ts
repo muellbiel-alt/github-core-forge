@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto';
-import { createServer, request as httpRequest, Agent as HttpAgent, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer, request as httpRequest, Agent as HttpAgent, type IncomingMessage, type ServerResponse } from 'node:http';
 import { deflateSync } from 'node:zlib';
 import { handleGitRequest } from './src/git.ts';
 import { handleGraphqlRequest } from './src/graphql.ts';
 import { handleMcpRequest } from './src/mcp.ts';
 import { handleRestRequest } from './src/rest.ts';
 import { ForgeStore } from './src/store.ts';
+import { createRawServer } from './src/transport.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const HEALTHZ_BUF = Buffer.from('{"ok":true}\n', 'utf8');
@@ -14,7 +15,28 @@ const NOT_FOUND_BUF = Buffer.from('{"message":"Not Found"}\n', 'utf8');
 const BAD_REQ_BUF = Buffer.from('{"message":"Bad Request"}\n', 'utf8');
 const EMPTY_BUF = Buffer.alloc(0);
 const EMPTY_QUERY = new URLSearchParams();
-const GIT_ROUTE_RE = /^\/([^/]+)\/([^/]+)\.git(\/.*)$/;
+/** One reusable headers object for the two hot JSON paths (cached GET, fast POST).
+ * Node copies header values into the response at writeHead time, so mutating the shared
+ * object before the next writeHead is safe (single-threaded, synchronous, no await in between). */
+const HOT_JSON_HEADERS: Record<string, string | number> = {
+  'content-type': JSON_TYPE,
+  'content-length': 0,
+  'x-github-request-id': '',
+};
+
+/** The server surface main.ts and warmUpServer rely on. Both transports satisfy it: the
+ * node:http server natively, the raw-TCP transport through a thin wrapper in
+ * src/transport.ts (its three timeout fields are plain numbers main.ts sets the same way;
+ * the raw transport has no timeouts by design, matching requestTimeout = 0). */
+export interface ForgeServer {
+  keepAliveTimeout: number;
+  headersTimeout: number;
+  requestTimeout: number;
+  once(event: 'error', cb: (err: Error) => void): void;
+  listen(port: number, hostOrCb?: string | (() => void), cb?: () => void): void;
+  address(): { port: number } | string | null;
+  close(cb?: () => void): void;
+}
 
 function isAuthorized(req: IncomingMessage, expectedToken: string, expectedBearer: string): boolean {
   if (expectedToken === '') return true;
@@ -37,8 +59,13 @@ function sendStaticJson(res: ServerResponse, status: number, buf: Buffer, reqId?
   res.end(buf);
 }
 
-/** Build the deterministic in-memory forge HTTP server. */
-export function createApp(): Server {
+/** Build the transport-agnostic request handler: the store plus the per-request dispatch
+ * closure. Both the node:http server (createApp) and the raw-TCP transport
+ * (src/transport.ts) drive the SAME handler, so conformance can never drift between them.
+ * The handler only touches the node:http shape (method, url, headers,
+ * on('data'/'end'/'error'); writeHead, end, headersSent) — the raw transport supplies
+ * duck-typed equivalents for those. */
+export function createForgeHandler(): { store: ForgeStore; handleRequest: (req: IncomingMessage, res: ServerResponse) => void } {
   const store = new ForgeStore(process.env.MAKEFUN_TRIAL_NOW);
   const expectedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
   const expectedBearer = expectedToken === '' ? '' : `Bearer ${expectedToken}`;
@@ -64,13 +91,23 @@ export function createApp(): Server {
         handleMcpRequest(store, req, res, body, reqId);
         return;
       }
-      const gitMatch = GIT_ROUTE_RE.exec(pathname);
-      if (gitMatch) {
-        const owner = decodeURIComponent(gitMatch[1]!);
-        const repoName = decodeURIComponent(gitMatch[2]!);
-        const subpath = gitMatch[3]!;
-        handleGitRequest(store, req, res, owner, repoName, subpath, query, body);
-        return;
+      // Manual git route parse (no regex): /{owner}/{repo}.git{subpath}. The repo segment
+      // must hold no '/' (the regex required that too); owner/repo are decoded only when
+      // they actually carry a '%' escape.
+      const ownerEnd = pathname.indexOf('/', 1);
+      if (ownerEnd > 1) {
+        const gitMark = pathname.indexOf('.git/', ownerEnd);
+        if (gitMark > ownerEnd + 1) {
+          const repoRaw = pathname.slice(ownerEnd + 1, gitMark);
+          if (repoRaw.indexOf('/') < 0) {
+            const ownerRaw = pathname.slice(1, ownerEnd);
+            const owner = ownerRaw.indexOf('%') < 0 ? ownerRaw : decodeURIComponent(ownerRaw);
+            const repoName = repoRaw.indexOf('%') < 0 ? repoRaw : decodeURIComponent(repoRaw);
+            const subpath = pathname.slice(gitMark + 4);
+            handleGitRequest(store, req, res, owner, repoName, subpath, query, body);
+            return;
+          }
+        }
       }
       sendStaticJson(res, 404, NOT_FOUND_BUF, reqId);
     } catch (err) {
@@ -84,7 +121,7 @@ export function createApp(): Server {
     }
   };
 
-  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+  const handleRequest = (req: IncomingMessage, res: ServerResponse): void => {
     const rawUrl = req.url ?? '/';
     const qIdx = rawUrl.indexOf('?');
     const pathname = qIdx < 0 ? rawUrl : rawUrl.slice(0, qIdx);
@@ -104,11 +141,9 @@ export function createApp(): Server {
     if (method === 'GET') {
       const cachedIssue = store.issueRouteCache.get(pathname);
       if (cachedIssue !== undefined) {
-        res.writeHead(200, {
-          'content-type': JSON_TYPE,
-          'content-length': cachedIssue.length,
-          'x-github-request-id': reqId,
-        });
+        HOT_JSON_HEADERS['content-length'] = cachedIssue.length;
+        HOT_JSON_HEADERS['x-github-request-id'] = reqId;
+        res.writeHead(200, HOT_JSON_HEADERS);
         res.end(cachedIssue);
         return;
       }
@@ -160,11 +195,9 @@ export function createApp(): Server {
             sendStaticJson(res, 422, Buffer.from(`${JSON.stringify({ message: created.error })}\n`, 'utf8'), reqId);
             return;
           }
-          res.writeHead(201, {
-            'content-type': JSON_TYPE,
-            'content-length': created.issue.serializedJson.length,
-            'x-github-request-id': reqId,
-          });
+          HOT_JSON_HEADERS['content-length'] = created.issue.serializedJson.length;
+          HOT_JSON_HEADERS['x-github-request-id'] = reqId;
+          res.writeHead(201, HOT_JSON_HEADERS);
           res.end(created.issue.serializedJson);
           return;
         }
@@ -174,20 +207,32 @@ export function createApp(): Server {
     req.on('error', () => {
       if (!res.headersSent) sendStaticJson(res, 400, BAD_REQ_BUF, reqId);
     });
-  });
+  };
 
-  server.on('connection', (socket) => {
-    socket.setNoDelay(true);
-  });
+  return { store, handleRequest };
+}
 
-  return server;
+/** Build the deterministic in-memory forge server. Transport is chosen by
+ * MAKEFUN_TRANSPORT: 'raw' (default) drives the hand-rolled HTTP/1.1 parser in
+ * src/transport.ts — the perf lever; 'http' keeps the node:http server as a fallback.
+ * main.ts is untouched: it only sees the ForgeServer surface. */
+export function createApp(): ForgeServer {
+  const { handleRequest } = createForgeHandler();
+  if (process.env.MAKEFUN_TRANSPORT === 'http') {
+    const server = createServer(handleRequest);
+    server.on('connection', (socket) => {
+      socket.setNoDelay(true);
+    });
+    return server as unknown as ForgeServer;
+  }
+  return createRawServer(handleRequest);
 }
 
 /** Run a short throwaway loopback warmup so V8 JIT-compiles hot server paths before registration. */
-export async function warmUpServer(): Promise<void> {
+export async function warmUpServer(makeServer: () => ForgeServer = createApp): Promise<void> {
   const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
   const authHeader = token === '' ? '' : `Bearer ${token}`;
-  const warmServer = createApp();
+  const warmServer = makeServer();
   await new Promise<void>((resolve) => warmServer.listen(0, '127.0.0.1', () => resolve()));
   const addr = warmServer.address();
   if (addr === null || typeof addr === 'string') {

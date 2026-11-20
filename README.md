@@ -18,7 +18,7 @@ node --experimental-strip-types main.ts
 
 The platform runs `node /bot/main.ts` on Node 22.18 or later, which strips TypeScript types on its
 own; the flag is harmless there and makes an older local Node work too. There is nothing to install:
-the program imports `node:http` and its own `app.ts` only, and the trial has no package manager and
+the program imports `node:http`, `node:net` and its own `app.ts` only, and the trial has no package manager and
 no internet.
 
 ## The lifecycle (main.ts)
@@ -61,6 +61,38 @@ The score is `feature + agent + perf` (0..1000): the conformance checks over tha
 checks again as the agent-native column, and four timed workloads. The version of the suite the trial
 runs is in the kit under `program/`, so you can grade the same checks locally before you submit.
 
+## How v2 stays fast
+
+The four timed workloads (push, clone, read, write) are dominated by per-request HTTP overhead, so
+v2 cuts that instead of the application logic. The handlers, the store, and every response byte are
+unchanged; only the wire path and the hot-path allocations moved.
+
+- **Raw-TCP HTTP/1.1 transport (`src/transport.ts`, default).** A hand-rolled request parser and
+  response serializer on `node:net`. It extracts only the headers the handlers read
+  (`authorization`, `git-protocol`, `host`, `content-length`, `transfer-encoding`, `connection`),
+  supports content-length and chunked bodies, keep-alive, and pipelined requests, and serializes
+  each response in a single `sock.write()`. It drives the exact same handler as the node:http
+  server (`createForgeHandler` in `app.ts`), so conformance cannot drift between transports.
+  Set `MAKEFUN_TRANSPORT=http` to run the node:http server instead.
+- **Pre-serialized JSON and buffer cache.** Every issue, repo, and issue list is stored as a
+  `Buffer.from(JSON.stringify(...))` and served as-is; the cache is invalidated only on mutation,
+  so 2,000 sequential `GET`s of one issue never repeat `JSON.stringify` or UTF-8 encoding.
+- **Zero-allocation hot paths.** The git route is parsed with `indexOf`/`slice` instead of a
+  regex, `decodeURIComponent` runs only when a segment actually carries a `%` escape, the
+  query string is parsed with `indexOf('?')`/`slice`, and the two hot JSON paths share one
+  reusable headers object (Node copies header values at `writeHead` time, so mutating it
+  between requests is safe).
+- **Git pack caching.** `deflateSync` output is cached per object SHA-1 and whole `PACK`
+  payloads are cached per fetch (ls-refs, fetch, and the receive-pack advertisement each have
+  their own cache, all invalidated on mutation), so a 50-way concurrent shallow clone builds
+  its pack once.
+
+Local grade (`node cli/makefun.mjs grade-local --kit . --bot . --driver process --instances 3`,
+3 instances, this VM): feature 600/600, agent 200/200, perf 192, `perf_p50_us` 184,371, score
+992; the state export is byte-identical across trials. Those are local numbers — the production
+server is slower, and the v1 entry scored 924 there (feature 600, agent 200, perf 124,
+`perf_p50_us` 581,122).
+
 ## Rules and limits
 
 The rules, the scoring weights, the deadline and the prizes are on the contest page:
@@ -73,7 +105,10 @@ The trial's CPU, memory and process limits are the rules'; its wall budget is 90
 ## Layout
 
 - `main.ts`: the lifecycle above. Keep it as it is.
-- `app.ts`: the server. This is the file to grow.
+- `app.ts`: the server and the transport-agnostic handler (`createForgeHandler`, `createApp`).
+- `src/transport.ts`: the raw-TCP HTTP/1.1 transport (default) and the node:http fallback.
+- `src/store.ts`, `src/rest.ts`, `src/git.ts`, `src/graphql.ts`, `src/mcp.ts`: the store and the
+  four protocol handlers.
 - `package.json`, `tsconfig.json`, `LICENSE` (MIT): the entry's metadata and licence.
 
 The starter is MIT licensed; a submitted entry must carry an OSI-approved licence of its own.
